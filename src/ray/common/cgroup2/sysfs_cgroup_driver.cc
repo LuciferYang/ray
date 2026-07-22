@@ -82,8 +82,12 @@ Status SysFsCgroupDriver::CheckCgroupv2Enabled() {
   }
 
   // After parsing the mount file, the file should be at the EOF position.
-  // If it's not, getmntent encountered an error.
-  if (!feof(fp) || !endmntent(fp)) {
+  // If it's not, getmntent encountered an error. Call endmntent unconditionally
+  // so the handle is closed even on the parse-error path; short-circuiting on
+  // !feof would otherwise leak fp.
+  const bool reached_eof = feof(fp) != 0;
+  const bool closed = endmntent(fp) != 0;
+  if (!reached_eof || !closed) {
     return Status::Invalid(
         absl::StrFormat("Failed to parse mount file at %s. Could not verify that "
                         "cgroupv2 was mounted correctly.",
@@ -254,16 +258,19 @@ Status SysFsCgroupDriver::MoveAllProcesses(const std::string &from,
   }
   pid_t pid = 0;
   while (in_file >> pid) {
-    if (in_file.fail()) {
-      return Status::Invalid(absl::StrFormat(
-          "Could not read PID from cgroup procs file %s", from_procs_file_path));
-    }
     out_file << pid;
     out_file.flush();
     if (out_file.fail()) {
       return Status::Invalid(absl::StrFormat(
           "Could not write pid to cgroup procs file %s", to_procs_file_path));
     }
+  }
+  // A failed extraction ends the loop, so the read error must be checked here,
+  // not inside the loop where it is unreachable. eof() is the normal stop
+  // condition; anything else means the procs file was not fully read.
+  if (in_file.fail() && !in_file.eof()) {
+    return Status::Invalid(absl::StrFormat("Could not read PID from cgroup procs file %s",
+                                           from_procs_file_path));
   }
   return Status::OK();
 }
