@@ -64,6 +64,21 @@ using ::testing::_;
 using ::testing::InvokeWithoutArgs;
 using ::testing::Return;
 
+class TestCoreWorkerClient : public rpc::FakeCoreWorkerClient {
+ public:
+  void GetObjectLocationsOwner(
+      const rpc::GetObjectLocationsOwnerRequest &,
+      const rpc::ClientCallback<rpc::GetObjectLocationsOwnerReply> &callback) override {
+    if (respond_to_location_requests_) {
+      num_location_requests_++;
+      callback(Status::OK(), rpc::GetObjectLocationsOwnerReply());
+    }
+  }
+
+  bool respond_to_location_requests_ = false;
+  int num_location_requests_ = 0;
+};
+
 class CoreWorkerTest : public ::testing::Test {
  public:
   CoreWorkerTest()
@@ -107,8 +122,8 @@ class CoreWorkerTest : public ::testing::Test {
         io_service_, /*record_stats=*/false, /*local_address=*/"");
 
     auto core_worker_client_pool =
-        std::make_shared<rpc::CoreWorkerClientPool>([](const rpc::Address &) {
-          return std::make_shared<rpc::FakeCoreWorkerClient>();
+        std::make_shared<rpc::CoreWorkerClientPool>([this](const rpc::Address &) {
+          return mock_core_worker_client_;
         });
 
     auto raylet_client_pool = std::make_shared<rpc::RayletClientPool>(
@@ -325,6 +340,8 @@ class CoreWorkerTest : public ::testing::Test {
   std::unique_ptr<rpc::ClientCallManager> client_call_manager_;
   std::shared_ptr<ReferenceCounterInterface> reference_counter_;
   std::shared_ptr<CoreWorkerMemoryStore> memory_store_;
+  std::shared_ptr<TestCoreWorkerClient> mock_core_worker_client_ =
+      std::make_shared<TestCoreWorkerClient>();
   ActorTaskSubmitter *actor_task_submitter_;
   pubsub::Publisher *object_info_publisher_;
   std::shared_ptr<TaskManager> task_manager_;
@@ -362,6 +379,39 @@ TaskSpecification CreateStreamingGeneratorTaskSpec() {
   task.GetMutableMessage().set_streaming_generator(true);
   task.GetMutableMessage().set_generator_backpressure_num_objects(-1);
   return task;
+}
+
+TEST_F(CoreWorkerTest, GetLocationFromOwnerCountsAllBatchesBeforeCallbacks) {
+  const auto object_id_1 = ObjectID::FromRandom();
+  const auto object_id_2 = ObjectID::FromRandom();
+  rpc::Address owner_address_1;
+  owner_address_1.set_worker_id(WorkerID::FromRandom().Binary());
+  rpc::Address owner_address_2;
+  owner_address_2.set_worker_id(WorkerID::FromRandom().Binary());
+
+  reference_counter_->AddOwnedObject(object_id_1,
+                                     {},
+                                     owner_address_1,
+                                     "",
+                                     0,
+                                     LineageReconstructionEligibility::INELIGIBLE_PUT,
+                                     true);
+  reference_counter_->AddOwnedObject(object_id_2,
+                                     {},
+                                     owner_address_2,
+                                     "",
+                                     0,
+                                     LineageReconstructionEligibility::INELIGIBLE_PUT,
+                                     true);
+  mock_core_worker_client_->respond_to_location_requests_ = true;
+
+  std::vector<std::shared_ptr<ObjectLocation>> results;
+  ASSERT_TRUE(core_worker_->GetLocationFromOwner({object_id_1, object_id_2},
+                                                 /*timeout_ms=*/1000,
+                                                 &results)
+                  .ok());
+  ASSERT_EQ(results.size(), 2);
+  ASSERT_EQ(mock_core_worker_client_->num_location_requests_, 2);
 }
 
 TEST_F(CoreWorkerTest, PeekObjectRefStreamNReturnsExpectedRefs) {
